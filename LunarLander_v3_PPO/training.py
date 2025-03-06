@@ -1,5 +1,10 @@
-import gymnasium
 import os
+# Force CPU usage by setting environment variables
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+import gymnasium
+import torch  # Import torch to configure CPU usage
+torch.set_num_threads(1)  # Optional: limit CPU threads
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -23,8 +28,8 @@ BATCH_SIZE = 256
 GAE_LAMBDA = 0.95
 
 # Network architecture.
-POLICY_HIDDEN_SIZES = [128, 128, 128]
-VALUE_HIDDEN_SIZES = [64, 64, 64]
+POLICY_HIDDEN_SIZES = [32, 32, 32, 32]
+VALUE_HIDDEN_SIZES = [256, 256, 256]
 
 # Training function.
 def train_ppo(env_name, total_timesteps=TOTAL_TIMESTEPS, save_path="LunarLander_v3_PPO/saved_model"):
@@ -39,21 +44,29 @@ def train_ppo(env_name, total_timesteps=TOTAL_TIMESTEPS, save_path="LunarLander_
         )
     )
     
-    # Create PPO agent.
-    model = PPO(
-        "MlpPolicy", 
-        env,
-        learning_rate=LEARNING_RATE,
-        n_steps=2048,  # Default PPO buffer size per update.
-        batch_size=BATCH_SIZE,
-        n_epochs=N_EPOCHS,
-        gamma=GAMMA,
-        gae_lambda=GAE_LAMBDA,
-        clip_range=CLIP_RANGE,
-        target_kl=TARGET_KL,
-        policy_kwargs=policy_kwargs,
-        verbose=1
-    )
+    # Check if we have a saved model to resume from
+    final_model_path = os.path.join(save_path, "final_model")
+    if os.path.exists(f"{final_model_path}.zip"):
+        print(f"Resuming training from {final_model_path}...")
+        model = PPO.load(final_model_path, env=env)
+    else:
+        print("Starting training from scratch...")
+        # Create PPO agent.
+        model = PPO(
+            "MlpPolicy", 
+            env,
+            learning_rate=LEARNING_RATE,
+            n_steps=2048,  # Default PPO buffer size per update.
+            batch_size=BATCH_SIZE,
+            n_epochs=N_EPOCHS,
+            gamma=GAMMA,
+            gae_lambda=GAE_LAMBDA,
+            clip_range=CLIP_RANGE,
+            target_kl=TARGET_KL,
+            policy_kwargs=policy_kwargs,
+            device="cpu",  # Force CPU usage
+            verbose=1
+        )
     
     # Set up saving callbacks.
     os.makedirs(save_path, exist_ok=True)
@@ -99,8 +112,99 @@ def visualize_agent(env_name, model):
     print(f"Visualization episode finished with total reward: {total_reward:.2f}")
     env.close()
 
+def estimate_network_memory(policy_hidden_sizes=POLICY_HIDDEN_SIZES, 
+                           value_hidden_sizes=VALUE_HIDDEN_SIZES,
+                           obs_dim=8,  # LunarLander-v3 observation dimension
+                           action_dim=4):  # LunarLander-v3 action dimension
+    """
+    Estimate memory requirements for policy and value networks based on 
+    network architecture, without loading any model files.
+    
+    Args:
+        policy_hidden_sizes (list): Hidden layer sizes for policy network.
+        value_hidden_sizes (list): Hidden layer sizes for value network.
+        obs_dim (int): Observation space dimension.
+        action_dim (int): Action space dimension.
+        
+    Returns:
+        dict: Dictionary containing parameter counts and memory requirements.
+    """
+    # Calculate policy network parameters.
+    policy_params = 0
+    prev_dim = obs_dim
+    
+    # Add parameters for each layer in policy network.
+    for dim in policy_hidden_sizes:
+        # Weight matrix + bias vector.
+        policy_params += (prev_dim * dim) + dim
+        prev_dim = dim
+    
+    # Output layer from last hidden to action space.
+    policy_params += (prev_dim * action_dim) + action_dim
+    
+    # Calculate value network parameters.
+    value_params = 0
+    prev_dim = obs_dim
+    
+    # Add parameters for each layer in value network.
+    for dim in value_hidden_sizes:
+        # Weight matrix + bias vector.
+        value_params += (prev_dim * dim) + dim
+        prev_dim = dim
+    
+    # Output layer (scalar value).
+    value_params += prev_dim + 1  # weights + bias for single output
+    
+    # Total parameters.
+    total_params = policy_params + value_params
+    
+    # Calculate memory size (assuming float32 - 4 bytes per parameter).
+    bytes_per_param = 4  # float32
+    policy_memory_bytes = policy_params * bytes_per_param
+    value_memory_bytes = value_params * bytes_per_param
+    total_memory_bytes = total_params * bytes_per_param
+    
+    # Format output sizes.
+    def format_size(bytes):
+        kb = bytes / 1024
+        mb = kb / 1024
+        if mb >= 1:
+            return f"{mb:.2f} MB"
+        elif kb >= 1:
+            return f"{kb:.2f} KB"
+        else:
+            return f"{bytes} bytes"
+    
+    # Print results.
+    print("\nEstimated Model Memory Requirements:")
+    print("=" * 50)
+    print(f"Policy Network Architecture: {[obs_dim]} + {policy_hidden_sizes} + [{action_dim}]")
+    print(f"  - Parameters: {policy_params:,}")
+    print(f"  - Memory size: {format_size(policy_memory_bytes)}")
+    
+    print(f"\nValue Network Architecture: {[obs_dim]} + {value_hidden_sizes} + [1]")
+    print(f"  - Parameters: {value_params:,}")
+    print(f"  - Memory size: {format_size(value_memory_bytes)}")
+    
+    print("\nTotal:")
+    print(f"  - Parameters: {total_params:,}")
+    print(f"  - Memory size: {format_size(total_memory_bytes)}")
+    print("=" * 50)
+    
+    return {
+        "policy_params": policy_params,
+        "value_params": value_params,
+        "policy_memory": policy_memory_bytes,
+        "value_memory": value_memory_bytes,
+        "total_params": total_params,
+        "total_memory": total_memory_bytes
+    }
+
 # Main execution.
 if __name__ == "__main__":
+    # Estimate memory requirements based on network architecture.
+    estimate_network_memory()
+    
     if TRAIN:
         # Train the agent.
         model = train_ppo("LunarLander-v3", TOTAL_TIMESTEPS)
