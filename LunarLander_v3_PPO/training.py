@@ -10,7 +10,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 
 # Whether to train, or if not, to just evaluate.
-TRAIN = True
+TRAIN = False
 
 # Hyperparameters.
 # Training parameters.
@@ -28,7 +28,7 @@ BATCH_SIZE = 256
 GAE_LAMBDA = 0.95
 
 # Network architecture.
-POLICY_HIDDEN_SIZES = [32, 32, 32, 32]
+POLICY_HIDDEN_SIZES = [12, 12, 12]
 VALUE_HIDDEN_SIZES = [256, 256, 256]
 
 # Training function.
