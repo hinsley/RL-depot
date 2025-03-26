@@ -4,7 +4,7 @@ import gymnasium as gym
 from stable_baselines3 import SAC
 
 # Network architecture.
-POLICY_HIDDEN_SIZES = [128, 128, 128]
+POLICY_HIDDEN_SIZES = [256, 256, 256]
 VALUE_HIDDEN_SIZES = [256, 256, 256]
 
 # Model save path.
