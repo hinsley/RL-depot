@@ -13,11 +13,12 @@ from torch.distributions import Normal
 import random
 from tqdm import tqdm
 
-STUDENT_HIDDEN_SIZES = [64, 64]
-LEARNING_RATE = 3e-4
+STUDENT_HIDDEN_SIZES = [32, 32, 32, 32]
+LEARNING_RATE = 1e-3 # 3e-4
 TRAINING_EXAMPLES = 3e5
-EPOCHS = 1e3
-BATCH_SIZE = 2**10
+EPOCHS = 3e3
+BATCH_SIZE = 2**12
+EVAL_INTERVAL = 3e2
 EVAL_EPISODES = 2**5
 SAVE_PATH = "LunarLander_v3_SAC_distill"
 
@@ -133,14 +134,34 @@ def kl_divergence_loss(teacher_mean, teacher_std, student_mean, student_std):
                (2 * teacher_std.pow(2)) - 0.5)
     return kl_div.sum(dim=1).mean()
 
+def save_teacher_samples(states, means, stds, file_path):
+    """Save teacher samples to disk."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    np.savez(file_path, 
+             states=states, 
+             means=means, 
+             stds=stds)
+    print(f"Teacher samples saved to {file_path}.")
+
+def load_teacher_samples(file_path):
+    """Load teacher samples from disk."""
+    data = np.load(file_path)
+    print(f"Teacher samples loaded from {file_path}.")
+    return data['states'], data['means'], data['stds']
+
 def collect_teacher_samples(env, model, num_samples=10000):
     """Collect state-action pairs from the teacher model."""
     print("Starting collect_teacher_samples")
     states = []
-    actions = []
+    means = []
+    stds = []
     
     # For SB3 models, we should use the model's native get_env() method
     sb3_env = model.get_env()
+    
+    # Get device from model
+    device = next(model.policy.parameters()).device
+    print(f"Model is on device: {device}")
     
     # Reset the environment (VecEnv always returns just the observation)
     obs = sb3_env.reset()
@@ -148,17 +169,26 @@ def collect_teacher_samples(env, model, num_samples=10000):
     for _ in tqdm(range(num_samples), desc="Collecting teacher samples"):
         states.append(obs[0])  # VecEnv returns observations as arrays
         
-        # Use the model to get an action
-        action, _ = model.predict(obs, deterministic=False)
-        actions.append(action[0])
+        # Get the action distribution from the SAC policy directly
+        with torch.no_grad():
+            # Convert to tensor and move to correct device
+            obs_tensor = torch.FloatTensor(obs).to(device)
+            
+            # Get the action parameters
+            mean_actions, log_std, _ = model.policy.actor.get_action_dist_params(obs_tensor)
+            
+            # Move back to CPU for storage
+            means.append(mean_actions[0].cpu().numpy())
+            stds.append(torch.exp(log_std)[0].cpu().numpy())
         
-        # Step the environment - VecEnv has a different interface
+        # Take an action to advance the environment
+        action, _ = model.predict(obs, deterministic=False)
         obs, _, dones, infos = sb3_env.step(action)
         
         if len(states) >= num_samples:
             break
     
-    return np.array(states), np.array(actions)
+    return np.array(states), np.array(means), np.array(stds)
 
 def main(args):
     # Set seeds for reproducibility
@@ -199,14 +229,22 @@ def main(args):
         start_epoch = checkpoint['epoch']
         print(f"Resuming training from epoch {start_epoch}.")
     
-    # Collect samples from teacher
-    states, actions = collect_teacher_samples(
-        env, teacher_model, num_samples=args.num_samples
-    )
+    # Check if teacher samples exist on disk, otherwise collect them
+    samples_path = args.samples_path
+    if os.path.exists(samples_path):
+        # Load samples from disk
+        states, teacher_means, teacher_stds = load_teacher_samples(samples_path)
+    else:
+        # Collect samples from teacher and save to disk
+        states, teacher_means, teacher_stds = collect_teacher_samples(
+            env, teacher_model, num_samples=args.num_samples
+        )
+        save_teacher_samples(states, teacher_means, teacher_stds, samples_path)
     
     # Convert to torch tensors
     states_tensor = torch.FloatTensor(states)
-    actions_tensor = torch.FloatTensor(actions)
+    teacher_means_tensor = torch.FloatTensor(teacher_means)
+    teacher_stds_tensor = torch.FloatTensor(teacher_stds)
     
     # Initial evaluation before training
     print("\n=== Initial Evaluation ===")
@@ -219,8 +257,12 @@ def main(args):
     # Training loop
     batch_size = args.batch_size
     num_batches = len(states) // batch_size
+    best_loss = float('inf')  # Initialize best loss as infinity
     
-    for epoch in range(start_epoch, args.epochs):
+    # Create progress bar for epochs
+    progress_bar = tqdm(range(start_epoch, args.epochs), desc=f"Training (Best epoch loss: {best_loss:.4f})")
+    
+    for epoch in progress_bar:
         total_loss = 0
         
         # Shuffle data
@@ -230,7 +272,8 @@ def main(args):
         for batch_idx in range(num_batches):
             batch_indices = indices[batch_idx * batch_size:(batch_idx + 1) * batch_size]
             batch_states = states_tensor[batch_indices]
-            batch_actions = actions_tensor[batch_indices]
+            batch_teacher_means = teacher_means_tensor[batch_indices]
+            batch_teacher_stds = teacher_stds_tensor[batch_indices]
             
             # Forward pass
             student_means, student_log_stds = student_policy(batch_states)
@@ -238,8 +281,8 @@ def main(args):
             
             # Compute KL divergence loss
             loss = kl_divergence_loss(
-                batch_actions, 
-                torch.ones_like(batch_actions), 
+                batch_teacher_means, 
+                batch_teacher_stds, 
                 student_means, 
                 student_stds
             )
@@ -251,9 +294,14 @@ def main(args):
             
             total_loss += loss.item()
         
-        # Print epoch results
+        # Calculate average loss for this epoch
         avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch+1}/{args.epochs}, Loss: {avg_loss:.4f}")
+        
+        # Update best loss if current loss is better
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            # Update progress bar description with new best loss
+            progress_bar.set_description(f"Training (Best loss: {best_loss:.4f})")
         
         # Evaluate periodically
         if (epoch + 1) % args.eval_interval == 0:
@@ -276,7 +324,6 @@ def main(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
             }, save_path)
-            print(f"Checkpoint saved to {save_path}")
     
     # Final evaluation
     teacher_reward = evaluate_sb3_policy(teacher_eval_env, teacher_model, args.eval_episodes * 2)
@@ -354,7 +401,7 @@ parser.add_argument("--batch_size", type=int, default=int(BATCH_SIZE),
                     help="Batch size for training")
 parser.add_argument("--epochs", type=int, default=int(EPOCHS),
                     help="Number of epochs to train")
-parser.add_argument("--eval_interval", type=int, default=5, 
+parser.add_argument("--eval_interval", type=int, default=int(EVAL_INTERVAL), 
                     help="Interval to evaluate the policy")
 parser.add_argument("--eval_episodes", type=int, default=int(EVAL_EPISODES),
                     help="Number of episodes for evaluation")
@@ -362,8 +409,12 @@ parser.add_argument("--save_interval", type=int, default=10,
                     help="Interval to save checkpoints")
 parser.add_argument("--num_samples", type=int, default=int(TRAINING_EXAMPLES),
                     help="Number of samples to collect from teacher")
-parser.add_argument("--resume", action="store_true", 
-                    help="Resume training from checkpoint")
+parser.add_argument("--samples_path", type=str, default=os.path.join(SAVE_PATH, "teacher_samples.npz"), 
+                    help="Path to save/load teacher samples")
+parser.add_argument("--resume", action="store_true", default=True, 
+                    help="Resume training from checkpoint if it exists")
+parser.add_argument("--no_resume", action="store_false", dest="resume",
+                    help="Start training from scratch even if checkpoint exists")
 parser.add_argument("--seed", type=int, default=0,
                     help="Random seed")
 
@@ -371,4 +422,4 @@ args = parser.parse_args()
 main(args)
 
 # Uncomment the line below to run the visualization directly
-watch_student_policy()
+# watch_student_policy()
